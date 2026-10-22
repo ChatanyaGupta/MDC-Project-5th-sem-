@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Face Tracking and Head Movement Detection (Browser)</title>
+<style>
+  body { margin:0; font-family: Calibri, Arial, sans-serif; background:#f4f1e8; color:#222b26; }
+  header { background:#1a4731; color:#fff; padding:14px 24px; }
+  header h1 { margin:0; font-size:22px; }
+  header p { margin:4px 0 0; color:#e3c77a; font-size:14px; }
+  main { max-width:1000px; margin:20px auto; padding:0 16px; }
+  .bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+  button { background:#1a4731; color:#fff; border:0; border-radius:8px; padding:10px 18px; font-size:16px; cursor:pointer; }
+  button.alt { background:#b8923a; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  #status { font-size:14px; color:#6b7570; }
+  #view { width:100%; max-width:960px; background:#111; border-radius:10px; display:block; }
+  video { display:none; }
+  #report { margin-top:20px; }
+  #report canvas { max-width:100%; border-radius:10px; background:#fff; border:1px solid #d9d2bc; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Face Tracking and Head Movement Detection</h1>
+  <p>MDC Project · Multi-face tracker with Kalman filter, re-identification and session report (runs fully in your browser)</p>
+</header>
+<main>
+  <div class="bar">
+    <button id="btnStart">Start camera</button>
+    <button id="btnStop" class="alt" disabled>End session &amp; show report</button>
+    <button id="btnDownload" disabled>Download report (PNG)</button>
+    <span id="status">Ready. Click "Start camera" and allow camera access.</span>
+  </div>
+  <video id="video" playsinline muted></video>
+  <canvas id="view" width="640" height="480"></canvas>
+  <div id="report"></div>
+</main>
+
+<script type="module">
+import { FaceDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const WASM_URL  = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite";
+
+const DIRS = ["Center", "Left", "Right", "Up", "Down"];
+const PIE_COLORS = ["#3498db", "#e74c3c", "#2ecc71", "#f1c40f", "#9b59b6"];
+const MAX_LOST_MS = 1500;      // same idea as 45 missed frames at about 30 fps
+const REID_THRESHOLD = 0.45;   // histogram correlation needed to reuse an old ID
+const MIN_REPORT_SECONDS = 2;  // ignore faces seen for less than this
+
+const video = document.getElementById("video");
+const view = document.getElementById("view");
+const ctx = view.getContext("2d");
+const btnStart = document.getElementById("btnStart");
+const btnStop = document.getElementById("btnStop");
+const btnDownload = document.getElementById("btnDownload");
+const statusEl = document.getElementById("status");
+const reportEl = document.getElementById("report");
+
+const roi = document.createElement("canvas");
+roi.width = roi.height = 32;
+const rctx = roi.getContext("2d", { willReadFrequently: true });
+
+let detector = null, stream = null, running = false;
+let lastVideoTime = -1, prevFrameTime = 0, fps = 0;
+let tracked = new Map(), db = new Map(), nextId = 0;
+let lastResults = [];
+let reportCanvas = null;
+
+const newDur = () => ({ Center: 0, Left: 0, Right: 0, Up: 0, Down: 0 });
+const setStatus = (t) => { statusEl.textContent = t; };
+
+/* ---------- 1D Kalman filter (position + velocity), used for x and y ---------- */
+class Kalman1D {
+  constructor(x0) {
+    this.x0 = x0; this.x1 = 0;
+    this.P = [[1, 0], [0, 1]];
+    this.Q = 0.05; this.R = 0.1;
+  }
+  predict(dt) {
+    const P = this.P;
+    this.x0 += dt * this.x1;
+    const p00 = P[0][0] + dt * (P[0][1] + P[1][0]) + dt * dt * P[1][1] + this.Q;
+    const p01 = P[0][1] + dt * P[1][1];
+    const p10 = P[1][0] + dt * P[1][1];
+    const p11 = P[1][1] + this.Q;
+    this.P = [[p00, p01], [p10, p11]];
+    return this.x0;
+  }
+  update(z) {
+    const P = this.P;
+    const S = P[0][0] + this.R;
+    const k0 = P[0][0] / S, k1 = P[1][0] / S;
+    const y = z - this.x0;
+    this.x0 += k0 * y;
+    this.x1 += k1 * y;
+    this.P = [
+      [(1 - k0) * P[0][0], (1 - k0) * P[0][1]],
+      [P[1][0] - k1 * P[0][0], P[1][1] - k1 * P[0][1]],
+    ];
+  }
+}
+class Kalman2D {
+  constructor(x, y) { this.kx = new Kalman1D(x); this.ky = new Kalman1D(y); }
+  predict(dt) { return [this.kx.predict(dt), this.ky.predict(dt)]; }
+  update(x, y) { this.kx.update(x); this.ky.update(y); }
+}
+
+/* ---------- visual fingerprint: 16x16 hue/saturation histogram ---------- */
+function faceHist(bx, by, bw, bh) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const x1 = Math.max(0, Math.floor(bx)), y1 = Math.max(0, Math.floor(by));
+  const x2 = Math.min(vw, Math.ceil(bx + bw)), y2 = Math.min(vh, Math.ceil(by + bh));
+  if (x2 - x1 < 2 || y2 - y1 < 2) return null;
+  rctx.drawImage(video, x1, y1, x2 - x1, y2 - y1, 0, 0, 32, 32);
+  const d = rctx.getImageData(0, 0, 32, 32).data;
+  const h = new Float32Array(256);
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i] / 255, g = d[i + 1] / 255, b = d[i + 2] / 255;
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b), df = mx - mn;
+    let hue = 0;
+    if (df > 0) {
+      if (mx === r) hue = ((g - b) / df) % 6;
+      else if (mx === g) hue = (b - r) / df + 2;
+      else hue = (r - g) / df + 4;
+      hue *= 60; if (hue < 0) hue += 360;
+    }
+    const s = mx === 0 ? 0 : df / mx;
+    const hb = Math.min(15, Math.floor(hue / 360 * 16));
+    const sb = Math.min(15, Math.floor(s * 16));
+    h[hb * 16 + sb] += 1;
+  }
+  let lo = Infinity, hi = -Infinity;
+  for (const v of h) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  if (hi > lo) for (let i = 0; i < 256; i++) h[i] = (h[i] - lo) / (hi - lo);
+  return h;
+}
+function correl(a, b) {
+  let ma = 0, mb = 0;
+  for (let i = 0; i < a.length; i++) { ma += a[i]; mb += b[i]; }
+  ma /= a.length; mb /= b.length;
+  let num = 0, da = 0, db2 = 0;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i] - ma, y = b[i] - mb;
+    num += x * y; da += x * x; db2 += y * y;
+  }
+  const den = Math.sqrt(da * db2);
+  return den > 0 ? num / den : 0;
+}
+
+/* ---------- per-face state ---------- */
+class FaceState {
+  constructor(id, pos, hist, now) {
+    this.id = id;
+    this.kf = new Kalman2D(pos[0], pos[1]);
+    this.hist = hist;
+    this.lastSeen = now;
+    this.lastDir = null;
+    this.dirStart = now;
+    this.durations = newDur();
+    this.changes = 0;
+  }
+  update(pos, dir, hist, now) {
+    this.kf.update(pos[0], pos[1]);
+    this.lastSeen = now;
+    if (hist) {
+      if (this.hist) for (let i = 0; i < 256; i++) this.hist[i] = 0.9 * this.hist[i] + 0.1 * hist[i];
+      else this.hist = hist;
+    }
+    if (this.lastDir !== dir) {
+      if (this.lastDir !== null) {
+        this.durations[this.lastDir] += (now - this.dirStart) / 1000;
+        this.changes++;
+      }
+      this.lastDir = dir;
+      this.dirStart = now;
+    }
+  }
+  finalize(now) {
+    if (this.lastDir !== null) this.durations[this.lastDir] += (now - this.dirStart) / 1000;
+    this.lastDir = null;
+    this.dirStart = now;
+  }
+}
+
+/* ---------- direction from nose position inside the face box ---------- */
+function getDirection(nose, bbox) {
+  const [bx, by, bw, bh] = bbox;
+  const ox = bw > 0 ? (nose[0] - (bx + bw / 2)) / (bw / 2) : 0;
+  const oy = bh > 0 ? (nose[1] - (by + bh / 2)) / (bh / 2) : 0;
+  if (Math.abs(ox) < 0.08 && Math.abs(oy) < 0.08) return "Center";
+  if (Math.abs(ox) > Math.abs(oy)) return ox > 0 ? "Right" : "Left";
+  return oy > 0 ? "Down" : "Up";
+}
+
+/* ---------- main tracking step (same logic as face_tracker.py) ---------- */
+function trackFrame(dets, now, dt) {
+  const W = view.width;
+  const preds = new Map();
+  for (const [id, fs] of tracked) preds.set(id, fs.kf.predict(dt));
+
+  const unmatched = new Set(dets.map((_, i) => i));
+  const pot = [];
+  for (const [id, fs] of tracked) {
+    const p = preds.get(id);
+    for (const i of unmatched) {
+      const d = dets[i];
+      const distScore = Math.hypot(p[0] - d.nose[0], p[1] - d.nose[1]) / W;
+      let simScore = 1.0;
+      if (fs.hist && d.hist) simScore = 1.0 - correl(fs.hist, d.hist);
+      const total = distScore * 0.7 + simScore * 0.3;
+      if (distScore < 0.45 || simScore < 0.4) pot.push([total, id, i]);
+    }
+  }
+  pot.sort((a, b) => a[0] - b[0]);
+
+  const out = [];
+  const usedIds = new Set(), usedDets = new Set();
+  for (const [, id, i] of pot) {
+    if (usedIds.has(id) || usedDets.has(i)) continue;
+    const d = dets[i];
+    const dir = getDirection(d.nose, d.bbox);
+    tracked.get(id).update(d.nose, dir, d.hist, now);
+    out.push({ id, bbox: d.bbox, dir, score: d.score });
+    usedIds.add(id); usedDets.add(i); unmatched.delete(i);
+  }
+
+  for (const i of unmatched) {
+    const d = dets[i];
+    const dir = getDirection(d.nose, d.bbox);
+    let bestId = -1, maxSim = REID_THRESHOLD;
+    if (d.hist) {
+      for (const [id, rec] of db) {
+        if (tracked.has(id) || !rec.hist) continue;
+        const sim = correl(d.hist, rec.hist);
+        if (sim > maxSim) { maxSim = sim; bestId = id; }
+      }
+    }
+    let id;
+    if (bestId !== -1) {
+      id = bestId;
+      const rec = db.get(id);
+      const fs = new FaceState(id, d.nose, d.hist, now);
+      fs.durations = { ...rec.durations };
+      fs.changes = rec.changes;
+      fs.update(d.nose, dir, null, now);
+      tracked.set(id, fs);
+    } else {
+      id = nextId++;
+      const fs = new FaceState(id, d.nose, d.hist, now);
+      fs.update(d.nose, dir, null, now);
+      tracked.set(id, fs);
+      db.set(id, { hist: d.hist, durations: newDur(), changes: 0 });
+    }
+    out.push({ id, bbox: d.bbox, dir, score: d.score });
+  }
+
+  for (const [id, fs] of [...tracked]) {
+    if (now - fs.lastSeen > MAX_LOST_MS) {
+      fs.finalize(now);
+      db.set(id, { hist: fs.hist, durations: { ...fs.durations }, changes: fs.changes });
+      tracked.delete(id);
+    }
+  }
+  return out;
+}
+
+/* ---------- drawing ---------- */
+function drawFrame() {
+  const W = view.width, H = view.height;
+  ctx.save();
+  ctx.translate(W, 0); ctx.scale(-1, 1);        // mirror like cv2.flip(frame, 1)
+  ctx.drawImage(video, 0, 0, W, H);
+  ctx.restore();
+  for (const f of lastResults) {
+    const [x, y, w, h] = f.bbox;
+    const fs = tracked.get(f.id);
+    const changes = fs ? fs.changes : 0;
+    ctx.lineWidth = 2; ctx.strokeStyle = "#00ff00";
+    ctx.strokeRect(x, y, w, h);
+    ctx.font = "bold 20px Arial";
+    ctx.fillStyle = f.dir === "Center" ? "#4aa3ff" : "#ff4040";
+    ctx.fillText(f.dir, x, Math.max(18, y - 24));
+    ctx.font = "13px Arial"; ctx.fillStyle = "#ffffff";
+    ctx.fillText(`ID: ${f.id} | Changes: ${changes} | ${f.score.toFixed(2)}`, x, Math.max(34, y - 6));
+  }
+  ctx.font = "16px Arial"; ctx.fillStyle = "#ffffff";
+  ctx.fillText(`FPS: ${Math.round(fps)}`, W - 90, 26);
+}
+
+function loop() {
+  if (!running) return;
+  const now = performance.now();
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const W = view.width;
+    const res = detector.detectForVideo(video, now);
+    const dets = [];
+    for (const d of res.detections) {
+      const bb = d.boundingBox;
+      const nk = d.keypoints[2];                       // index 2 = nose tip
+      if (!bb || !nk) continue;
+      const hist = faceHist(bb.originX, bb.originY, bb.width, bb.height);   // from the raw frame
+      const mx = W - (bb.originX + bb.width);          // mirror x to match the displayed image
+      dets.push({
+        bbox: [mx, bb.originY, bb.width, bb.height],
+        nose: [W - nk.x * W, nk.y * view.height],
+        score: d.categories[0] ? d.categories[0].score : 0,
+        hist,
+      });
+    }
+    const dt = prevFrameTime ? Math.min(0.1, Math.max(0.01, (now - prevFrameTime) / 1000)) : 0.033;
+    lastResults = trackFrame(dets, now, dt);
+    if (prevFrameTime) fps = 1000 / (now - prevFrameTime);
+    prevFrameTime = now;
+  }
+  drawFrame();
+  requestAnimationFrame(loop);
+}
+
+/* ---------- start / stop ---------- */
+async function start() {
+  btnStart.disabled = true;
+  try {
+    if (!detector) {
+      setStatus("Loading face detection model (needs internet)...");
+      const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+      const make = (delegate) => FaceDetector.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: MODEL_URL, delegate },
+        runningMode: "VIDEO",
+        minDetectionConfidence: 0.5,
+      });
+      try { detector = await make("GPU"); } catch (e) { detector = await make("CPU"); }
+    }
+    setStatus("Starting camera...");
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    view.width = video.videoWidth; view.height = video.videoHeight;
+  } catch (err) {
+    console.error(err);
+    setStatus("Could not start: " + (err && err.message ? err.message : err));
+    btnStart.disabled = false;
+    return;
+  }
+  tracked = new Map(); db = new Map(); nextId = 0; lastResults = [];
+  lastVideoTime = -1; prevFrameTime = 0; fps = 0;
+  reportEl.innerHTML = ""; btnDownload.disabled = true; reportCanvas = null;
+  running = true;
+  btnStop.disabled = false;
+  setStatus("Tracking... press \"End session & show report\" when finished.");
+  requestAnimationFrame(loop);
+}
+
+function stop() {
+  running = false;
+  const now = performance.now();
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null;
+  btnStop.disabled = true; btnStart.disabled = false;
+
+  const summaries = [];
+  for (const [id, rec] of db) {
+    let durations = rec.durations, changes = rec.changes;
+    if (tracked.has(id)) {
+      const fs = tracked.get(id);
+      fs.finalize(now);
+      durations = fs.durations; changes = fs.changes;
+    }
+    const total = DIRS.reduce((s, d) => s + durations[d], 0);
+    if (total >= MIN_REPORT_SECONDS) summaries.push({ id, durations: { ...durations }, total, changes });
+  }
+  summaries.sort((a, b) => b.total - a.total);
+  buildReport(summaries);
+  setStatus("Session ended. Report generated below.");
+}
+
+/* ---------- report (pie charts drawn on a canvas, like analytics.py) ---------- */
+function drawPie(c, cx, cy, r, durations) {
+  const total = DIRS.reduce((s, d) => s + durations[d], 0);
+  if (total <= 0) { c.fillStyle = "#222"; c.font = "16px Arial"; c.textAlign = "center"; c.fillText("No Data", cx, cy); return; }
+  let a = -Math.PI / 2;
+  DIRS.forEach((d, i) => {
+    const v = durations[d];
+    if (v <= 0) return;
+    const ang = (v / total) * Math.PI * 2;
+    c.beginPath(); c.moveTo(cx, cy); c.arc(cx, cy, r, a, a + ang); c.closePath();
+    c.fillStyle = PIE_COLORS[i]; c.fill();
+    const mid = a + ang / 2;
+    const pct = (v / total) * 100;
+    c.textAlign = "center"; c.textBaseline = "middle";
+    c.fillStyle = "#222"; c.font = "14px Arial";
+    c.fillText(d, cx + Math.cos(mid) * (r + 22), cy + Math.sin(mid) * (r + 22));
+    if (pct >= 4) { c.fillStyle = "#fff"; c.font = "bold 13px Arial"; c.fillText(pct.toFixed(1) + "%", cx + Math.cos(mid) * r * 0.65, cy + Math.sin(mid) * r * 0.65); }
+    a += ang;
+  });
+}
+function textLines(c, lines, x, y, size) {
+  c.textAlign = "left"; c.textBaseline = "alphabetic";
+  c.fillStyle = "#222"; c.font = `${size}px "Courier New", monospace`;
+  lines.forEach((l, i) => c.fillText(l, x, y + i * (size + 8)));
+}
+function buildReport(summaries) {
+  reportEl.innerHTML = "";
+  if (!summaries.length) {
+    reportEl.textContent = "No face was tracked for at least " + MIN_REPORT_SECONDS + " seconds, so there is no data for a report.";
+    return;
+  }
+  const shown = summaries.slice(0, 5);
+  const rows = 1 + shown.length, rowH = 360;
+  const cv = document.createElement("canvas");
+  cv.width = 1200; cv.height = 80 + rowH * rows;
+  const c = cv.getContext("2d");
+  c.fillStyle = "#fff"; c.fillRect(0, 0, cv.width, cv.height);
+  c.fillStyle = "#000"; c.font = "bold 30px Arial"; c.textAlign = "center"; c.textBaseline = "alphabetic";
+  c.fillText("Face Tracking Cumulative Analytics Report", 600, 48);
+
+  const agg = newDur(); let aggTime = 0;
+  summaries.forEach((s) => { DIRS.forEach((d) => { agg[d] += s.durations[d]; }); aggTime += s.total; });
+  const attention = aggTime > 0 ? (agg.Center / aggTime) * 100 : 0;
+
+  c.fillStyle = "#000"; c.font = "bold 18px Arial"; c.textAlign = "center";
+  c.fillText("Overall Directional Distribution", 300, 100);
+  drawPie(c, 300, 100 + rowH / 2 - 10, 110, agg);
+  textLines(c, [
+    "SESSION SUMMARY", "---------------------------------",
+    "Total Unique Faces: " + summaries.length,
+    "Total Session Time: " + aggTime.toFixed(1) + "s",
+    "Overall Attention: " + attention.toFixed(1) + "%",
+    "---------------------------------",
+  ], 640, 100 + rowH / 2 - 50, 20);
+
+  shown.forEach((s, i) => {
+    const top = 80 + rowH * (i + 1);
+    c.fillStyle = "#000"; c.font = "16px Arial"; c.textAlign = "center";
+    c.fillText("Face ID: " + s.id + " Distribution", 300, top + 20);
+    drawPie(c, 300, top + rowH / 2, 110, s.durations);
+    const att = s.total > 0 ? (s.durations.Center / s.total) * 100 : 0;
+    textLines(c, [
+      "FACE ID: " + s.id,
+      "Total Visible: " + s.total.toFixed(1) + "s",
+      "Attention Score: " + att.toFixed(1) + "%",
+      "Direction Changes: " + s.changes,
+    ], 640, top + rowH / 2 - 30, 20);
+  });
+  reportCanvas = cv;
+  reportEl.appendChild(cv);
+  btnDownload.disabled = false;
+}
+
+function downloadReport() {
+  if (!reportCanvas) return;
+  reportCanvas.toBlob((blob) => {
+    const a = document.createElement("a");
+    const t = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+    a.href = URL.createObjectURL(blob);
+    a.download = "session_report_" + t + ".png";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+}
+
+btnStart.addEventListener("click", start);
+btnStop.addEventListener("click", stop);
+btnDownload.addEventListener("click", downloadReport);
+</script>
+</body>
+</html>
